@@ -1,0 +1,382 @@
+"""
+fitness_function.py - TensorNEAT fitness file: English sentence -> set of the 65 semantic primes.
+RULES-ONLY version: no annotations, no paired (sentence, desired-output) data.
+
+Contract with the GUI (UserFitnessProblem):
+    INPUTS   (rows x D_in)      what the network sees
+    TARGETS  (rows x N_ACTIVE)  a SHAPE PLACEHOLDER (zeros) that sizes the output layer; never read
+    fitness(predictions, reference) -> scalar, JAX-traceable, higher is better, max 0
+
+WHERE THE KNOWLEDGE COMES FROM
+    Only the frozen lexicon (WORD_PRIMES): which primes each English word needs. Sentences are
+    generated from templates and are unlabelled; nobody states what the right primes are.
+
+FITNESS (rule-based round trip)
+    Each output is the probability that a prime is on. A source word counts as explained when ALL of
+    its primes are on (soft AND). Then
+        recall    = share of the sentence's words explained by the chosen primes
+        precision = share of chosen primes that some source word actually needs
+        fitness   = (1 - W_DECISIVE) * F1 + W_DECISIVE * (1 - uncertainty) - 1        range -1 .. 0
+    Precision stops "switch everything on"; recall stops "switch everything off".
+
+HELD-OUT
+    Every 4th sentence is excluded from INPUTS. evaluate()/audit() score it with the same reward.
+
+GUI SETTINGS
+    Run the self-check: it prints the Maximum nodes / Maximum connections this file needs.
+    Everything below runs at import (the GUI re-executes this file on every edit): keep it cheap.
+"""
+import re
+import zlib
+
+import numpy as np
+
+try:
+    import jax.numpy as jnp
+except ImportError:                      # lets the self-check run without JAX installed
+    jnp = np
+
+# ==========================================================================
+# 1. The 65 primes
+# ==========================================================================
+PRIMES = [
+    "I", "YOU", "SOMEONE", "SOMETHING/THING", "PEOPLE", "BODY", "KIND", "PART",
+    "THIS", "THE SAME", "OTHER/ELSE", "ONE", "TWO", "MUCH/MANY", "LITTLE/FEW", "SOME", "ALL",
+    "GOOD", "BAD", "BIG", "SMALL",
+    "THINK", "KNOW", "WANT", "DON'T WANT", "FEEL", "SEE", "HEAR",
+    "SAY", "WORDS", "TRUE", "DO", "HAPPEN", "MOVE", "TOUCH",
+    "BE (SOMEWHERE)", "THERE IS", "HAVE", "BE (SOMEONE/SOMETHING)", "LIVE", "DIE",
+    "WHEN/TIME", "NOW", "BEFORE", "AFTER", "A LONG TIME", "A SHORT TIME", "FOR SOME TIME", "MOMENT",
+    "WHERE/PLACE", "HERE", "ABOVE", "BELOW", "FAR", "NEAR", "SIDE", "INSIDE",
+    "NOT", "MAYBE", "CAN", "BECAUSE", "IF", "VERY", "MORE", "LIKE/WAY/AS",
+]
+assert len(PRIMES) == 65
+N_PRIMES = 65
+
+_P = {}                                           # name or any slash-variant -> index
+for _i, _n in enumerate(PRIMES):
+    _P[_n] = _i
+    for _v in _n.split("/"):
+        _P[_v] = _i
+
+# ==========================================================================
+# 2. The frozen back-translator: English word -> the primes needed to express it
+# ==========================================================================
+EXPONENTS = {   # direct English exponents of single primes
+    "I": "i me my", "YOU": "you your", "SOMEONE": "someone somebody", "SOMETHING": "something thing",
+    "PEOPLE": "people", "BODY": "body", "KIND": "kind", "PART": "part", "THIS": "this these",
+    "THE SAME": "same", "OTHER": "other else another", "ONE": "one", "TWO": "two", "MUCH": "much",
+    "MANY": "many", "LITTLE": "little", "FEW": "few", "SOME": "some", "ALL": "all every",
+    "GOOD": "good", "BAD": "bad", "BIG": "big large", "SMALL": "small", "THINK": "think",
+    "KNOW": "know", "WANT": "want", "FEEL": "feel", "SEE": "see", "HEAR": "hear", "SAY": "say",
+    "WORDS": "word", "TRUE": "true", "DO": "do", "HAPPEN": "happen", "MOVE": "move",
+    "TOUCH": "touch", "HAVE": "have", "LIVE": "live", "DIE": "die", "TIME": "time when",
+    "NOW": "now", "BEFORE": "before", "AFTER": "after", "A LONG TIME": "long",
+    "A SHORT TIME": "short", "FOR SOME TIME": "while", "MOMENT": "moment", "PLACE": "place where",
+    "HERE": "here", "ABOVE": "above over", "BELOW": "below under", "FAR": "far", "NEAR": "near close",
+    "SIDE": "side", "INSIDE": "inside", "NOT": "not no", "MAYBE": "maybe may might perhaps",
+    "CAN": "can could", "BECAUSE": "because", "IF": "if", "VERY": "very", "MORE": "more",
+    "LIKE": "like way", "THERE IS": "exist",
+}
+LEXICON = {     # words that need several primes together ("|" separated)
+    "he": "THIS|SOMEONE", "she": "THIS|SOMEONE", "him": "THIS|SOMEONE", "her": "THIS|SOMEONE",
+    "his": "THIS|SOMEONE", "it": "THIS|SOMETHING", "they": "THIS|PEOPLE", "them": "THIS|PEOPLE",
+    "we": "I|PEOPLE", "us": "I|PEOPLE",
+    "person": "SOMEONE", "man": "SOMEONE", "woman": "SOMEONE", "human": "SOMEONE",
+    "child": "SOMEONE|SMALL", "baby": "SOMEONE|SMALL", "friend": "SOMEONE|GOOD|THINK",
+    "mother": "SOMEONE|BODY|BEFORE", "dog": "SOMETHING|LIVE|FEEL|MOVE", "cat": "SOMETHING|LIVE|FEEL|MOVE",
+    "animal": "SOMETHING|LIVE|FEEL|MOVE", "tree": "SOMETHING|LIVE|BIG", "house": "PLACE|LIVE|PEOPLE|INSIDE",
+    "home": "PLACE|LIVE|PEOPLE|INSIDE", "food": "SOMETHING|INSIDE|BODY|LIVE",
+    "kill": "DO|SOMEONE|DIE", "dead": "DIE", "death": "DIE", "alive": "LIVE",
+    "love": "FEEL|GOOD|WANT", "hate": "FEEL|BAD", "happy": "FEEL|GOOD", "sad": "FEEL|BAD",
+    "angry": "FEEL|BAD|SOMEONE", "afraid": "FEEL|BAD|CAN|HAPPEN",
+    "eat": "DO|INSIDE|BODY", "give": "DO|HAVE|OTHER", "take": "DO|HAVE", "make": "DO|THERE IS",
+    "tell": "SAY|SOMEONE|KNOW", "ask": "SAY|WANT", "help": "DO|GOOD|SOMEONE|CAN",
+    "need": "WANT|IF|NOT|BAD|CAN|HAPPEN", "talk": "SAY|WORDS", "speak": "SAY|WORDS",
+    "read": "SEE|WORDS", "write": "DO|WORDS", "learn": "KNOW|BEFORE|NOT", "forget": "NOT|KNOW|BEFORE",
+    "remember": "THINK|KNOW|BEFORE", "believe": "THINK|TRUE", "understand": "THINK|KNOW",
+    "go": "MOVE", "walk": "MOVE", "run": "MOVE|VERY", "come": "MOVE|HERE", "leave": "MOVE|NOT|HERE",
+    "huge": "VERY|BIG", "tiny": "VERY|SMALL", "great": "VERY|GOOD", "terrible": "VERY|BAD",
+    "old": "LIVE|A LONG TIME", "young": "LIVE|NOT|A LONG TIME",
+    "always": "ALL|TIME", "never": "NOT|ONE|TIME", "often": "MANY|TIME", "sometimes": "SOME|TIME",
+    "soon": "AFTER|NOW", "yesterday": "BEFORE|NOW", "tomorrow": "AFTER|NOW", "today": "NOW|TIME",
+    "everyone": "ALL|PEOPLE", "everything": "ALL|SOMETHING", "nobody": "NOT|SOMEONE",
+    "nothing": "NOT|SOMETHING", "everywhere": "ALL|PLACE",
+}
+WORD_PRIMES = {}
+for _prime, _words in EXPONENTS.items():
+    for _w in _words.split():
+        WORD_PRIMES[_w] = [_prime]
+for _w, _ps in LEXICON.items():
+    WORD_PRIMES[_w] = _ps.split("|")
+for _w, _ps in WORD_PRIMES.items():
+    for _p in _ps:
+        assert _p in _P, f"unknown prime '{_p}' for word '{_w}'"      # catches typos at import
+
+# ==========================================================================
+# 3. Text handling
+# ==========================================================================
+STOP = set("a an the to of at for from by with on is are am was were be been being will would "
+           "and or but so then just about into than".split())
+IRREGULAR = {"went": "go", "did": "do", "does": "do", "done": "do", "knew": "know", "known": "know",
+             "saw": "see", "seen": "see", "said": "say", "heard": "hear", "felt": "feel", "had": "have",
+             "has": "have", "ate": "eat", "gave": "give", "took": "take", "made": "make", "came": "come",
+             "ran": "run", "left": "leave", "thought": "think", "told": "tell", "wrote": "write",
+             "men": "man", "women": "woman", "children": "child", "dying": "die"}
+
+
+def _lemma(w):
+    if w in IRREGULAR:
+        return IRREGULAR[w]
+    if w in WORD_PRIMES:
+        return w
+    for cand in (w[:-1], w[:-2], w[:-3], w[:-3] + "e"):    # s / ed, es / ing, ing->e (moving), d (died)
+        if len(cand) > 1 and cand in WORD_PRIMES:
+            return cand
+    return w
+
+
+def _tokens(sentence):
+    return [_lemma(w) for w in re.findall(r"[a-z]+", sentence.lower()) if w not in STOP]
+
+
+def _word_vec(word, dim):
+    """Frozen pseudo-random word vector, identical across runs (seeded by crc32, not hash())."""
+    return np.random.default_rng(zlib.crc32(word.encode())).standard_normal(dim).astype(np.float32)
+
+
+# ==========================================================================
+# 4. Unlabelled sentences generated from templates.
+#    No annotations and no desired outputs exist anywhere in this file.
+# ==========================================================================
+SUBJ = ["I", "you", "he", "she", "they", "we", "someone", "everyone", "nobody", "the man",
+        "the woman", "the child", "the dog", "my friend", "people"]
+VERBS = ["think", "know", "want", "see", "hear", "say", "help", "love", "hate", "eat",
+         "go", "walk", "come", "leave", "kill", "tell", "understand", "remember", "forget",
+         "believe", "learn", "talk", "give", "take"]
+OBJ = ["something", "this", "the house", "food", "the baby", "the tree", "words",
+       "the same thing", "good things", "bad things"]
+ADJ = ["good", "bad", "big", "small", "happy", "sad", "old", "young", "huge", "tiny",
+       "great", "terrible", "angry", "afraid", "alive", "dead"]
+TIME = ["", "", "now", "soon", "yesterday", "tomorrow", "always", "never", "sometimes"]
+PLACE = ["", "", "here", "near the house", "far", "inside the house", "above the tree"]
+MODAL = ["will", "can", "may"]
+TEMPLATES = [
+    "{S} {M} {V} {O} {P} {T}",
+    "{S} is {A} {P} {T}",
+    "{S} {M} {V} {O} because {S2} {M2} {V2} {O2}",
+    "if {S} {M} {V} {O} {S2} {M2} {V2}",
+    "maybe {S} {M} {V} {O}",
+    "{S} is not {A}",
+    "{S} {M} not {V} {O}",
+]
+HAND = [
+    "I think you are good", "The child died", "People want good things",
+    "I know something bad happened", "She loves her baby", "He killed someone near the house",
+    "The dog is very big", "I want to go home", "You can see this", "Maybe nobody can help",
+    "Everyone knows the same thing", "My friend is happy because I helped", "The tree is above the house",
+    "If you eat food you live", "I hear words", "People say it is true", "The old man never talks",
+    "She is sad now", "We have two dogs", "They walked far", "Something bad will happen soon",
+    "I hate this place", "All people die", "Someone is inside the house", "I understand nothing",
+    "The baby is small and alive",
+]
+
+N_GEN_SENTENCES = 30                         # how many generated sentences to add
+TEST_EVERY = 4                      # every 4th sentence is held out
+INPUT_MODE = "words"                # "words": multi-hot of the words that occur
+                                    # "embedding": D_IN-dim frozen vector (see embed_sentences)
+D_IN = 16
+EMBED_FN = None                     # optional callable(list[str]) -> (n, d); used by "embedding"
+
+
+def _generate(n, seed=0):
+    rng = np.random.default_rng(seed)
+    pick = lambda xs: xs[rng.integers(len(xs))]
+    out = {}
+    for _ in range(50 * n):
+        if len(out) >= n:
+            break
+        s = pick(TEMPLATES).format(
+            S=pick(SUBJ), S2=pick(SUBJ), V=pick(VERBS), V2=pick(VERBS), O=pick(OBJ), O2=pick(OBJ),
+            A=pick(ADJ), M=pick(MODAL), M2=pick(MODAL), T=pick(TIME), P=pick(PLACE))
+        out[" ".join(s.split())] = None
+    return list(out)
+
+
+CORPUS = list(dict.fromkeys(HAND + _generate(N_GEN_SENTENCES)))
+N_SENT = len(CORPUS)
+_src_words = [_tokens(s) for s in CORPUS]
+VOCAB = sorted({w for ws in _src_words for w in ws})
+_W = {w: i for i, w in enumerate(VOCAB)}
+
+M_ALL = np.zeros((len(VOCAB), N_PRIMES), np.float32)       # word x prime: the RULES (frozen lexicon)
+for _w in VOCAB:
+    for _p in WORD_PRIMES.get(_w, []):
+        M_ALL[_W[_w], _P[_p]] = 1.0
+SRC_ALL = np.zeros((N_SENT, len(VOCAB)), np.float32)       # which words each sentence contains
+for _n, _ws in enumerate(_src_words):
+    for _w in _ws:
+        SRC_ALL[_n, _W[_w]] = 1.0
+
+_idx = np.arange(N_SENT)
+TEST_IDX = _idx[TEST_EVERY - 1::TEST_EVERY]
+TRAIN_IDX = np.setdiff1d(_idx, TEST_IDX)
+
+ACTIVE = np.flatnonzero((SRC_ALL @ M_ALL).sum(axis=0) > 0)  # output space: primes some corpus word uses
+N_ACTIVE = len(ACTIVE)
+TRAIN_WORDS = np.flatnonzero(SRC_ALL[TRAIN_IDX].sum(axis=0) > 0)
+M_ACT = M_ALL[:, ACTIVE]                                    # (V, k)
+
+
+def embed_sentences(sentences):
+    """(n, D_IN) float32 in [-1, 1]. Uses EMBED_FN (PCA'd to D_IN) if set, else frozen random word vectors."""
+    if EMBED_FN is not None:
+        raw = np.asarray(EMBED_FN(list(sentences)), np.float32)
+        raw = raw - raw.mean(axis=0, keepdims=True)
+        _, _, vt = np.linalg.svd(raw, full_matrices=False)
+        z = np.pad(raw @ vt[:D_IN].T, ((0, 0), (0, max(0, D_IN - min(D_IN, vt.shape[0])))))
+        return np.clip(z / (np.abs(z).max() + 1e-8), -1.0, 1.0).astype(np.float32)
+    out = np.zeros((len(sentences), D_IN), np.float32)
+    for i, s in enumerate(sentences):
+        ws = _tokens(s)
+        if ws:
+            out[i] = sum(_word_vec(w, D_IN) for w in ws) / np.sqrt(len(ws))
+    return np.clip(out / 2.0, -1.0, 1.0)
+
+
+X_ALL = SRC_ALL[:, TRAIN_WORDS] if INPUT_MODE == "words" else embed_sentences(CORPUS)
+INPUTS = X_ALL[TRAIN_IDX]
+INPUTS_TEST = X_ALL[TEST_IDX]
+
+# The GUI needs a TARGETS array to size the output layer. It is a shape placeholder ONLY:
+# fitness() never reads it, and it contains no desired outputs.
+TARGETS = np.zeros((len(TRAIN_IDX), N_ACTIVE), np.float32)
+
+SRC_TR = SRC_ALL[TRAIN_IDX]                                 # unlabelled input words per sentence
+SRC_TE = SRC_ALL[TEST_IDX]
+
+# ==========================================================================
+# 5. The fitness function: reward = how well the chosen primes explain the sentence's own words
+#    under the frozen rules. Pure jnp, static shapes -> safe under jit/vmap.
+# ==========================================================================
+W_DECISIVE = 0.1
+CLIP = 1e-7
+EPS = 1e-8
+
+
+def _need(src):
+    """(sentences, k): primes that at least one source word requires (a rule consequence, not a label)."""
+    return ((src @ M_ACT) > 0).astype(np.float32)
+
+
+NEED_TR = _need(SRC_TR)
+
+
+def _score(p, src, need, xp):
+    """Rule-based faithfulness. Returns (fitness in -1..0, F1)."""
+    p = xp.clip(xp.nan_to_num(p, nan=0.5), CLIP, 1.0 - CLIP)
+    explained = xp.exp(xp.log(p) @ M_ACT.T)                  # (n, V): soft AND over a word's primes
+    recall = xp.sum(src * explained) / max(float(src.sum()), 1.0)      # source words fully explained
+    precision = xp.sum(p * need) / xp.sum(p)                 # chosen primes some source word needs
+    f1 = 2.0 * precision * recall / (precision + recall + EPS)
+    decisive = xp.mean(4.0 * p * (1.0 - p))                  # 0 at exactly 0/1, 1 at 0.5
+    return (1.0 - W_DECISIVE) * f1 + W_DECISIVE * (1.0 - decisive) - 1.0, f1
+
+
+def fitness(predictions, reference):
+    """Higher is better, max 0. `reference` is ignored: the reward comes from the rules."""
+    return _score(predictions, SRC_TR, NEED_TR, jnp)[0]
+
+
+# ==========================================================================
+# 6. Offline helpers (not used during training)
+# ==========================================================================
+def evaluate(pred_train, pred_test, threshold=0.5):
+    """Same rule-based reward on TRAIN and held-out TEST sentences. `exact` = share of sentences whose
+    hard-decoded prime set equals the rules' set (a diagnostic only; it is never trained on)."""
+    res = {}
+    for name, p, src in (("train", pred_train, SRC_TR), ("test", pred_test, SRC_TE)):
+        p = np.asarray(p, np.float32).reshape(len(src), N_ACTIVE)
+        need = _need(src)
+        hard = (p > threshold).astype(np.float32)
+        fit_s, f1_s = _score(p, src, need, np)
+        fit_h, f1_h = _score(hard, src, need, np)
+        res[name] = {"soft": float(fit_s), "hard": float(fit_h), "f1": float(f1_h),
+                     "exact": float(np.mean(np.all(hard == need, axis=1)))}
+    return res
+
+
+def decode(predictions, threshold=0.5):
+    p = np.asarray(predictions, np.float32).reshape(-1, N_ACTIVE)
+    return [[PRIMES[ACTIVE[j]] for j in np.flatnonzero(row > threshold)] for row in p]
+
+
+def _surface(name):
+    return re.sub(r"\s*\(.*\)", "", name.split("/")[0])
+
+
+def _jaccard(a, b):
+    x, y = set(_tokens(a)), set(_tokens(b))
+    return len(x & y) / len(x | y) if x | y else 0.0
+
+
+def audit(pred_train, pred_test, backtranslate=None, similarity=None, threshold=0.5, limit=8):
+    """Text report. backtranslate: optional callable(prime_text -> English) that sees only the primes."""
+    ev = evaluate(pred_train, pred_test, threshold)
+    lines = [f"{k:5} soft {v['soft']:.4f}  hard {v['hard']:.4f}  F1 {v['f1']:.3f}  exact {v['exact']:.2f}"
+             for k, v in ev.items()]
+    sims = []
+    for tag, idx, pred in (("TRAIN", TRAIN_IDX, pred_train), ("TEST", TEST_IDX, pred_test)):
+        lines += ["", f"--- {tag} (first {limit}) ---"]
+        for i, names in list(zip(idx, decode(pred, threshold)))[:limit]:
+            text = " ".join(_surface(n) for n in names)
+            lines.append(f"{CORPUS[i]}\n    primes: {text or '(none)'}")
+            if backtranslate and text:
+                back = backtranslate(text)
+                s = (similarity or _jaccard)(CORPUS[i], back)
+                sims.append(s)
+                lines.append(f"    back  : {back}   [similarity {s:.2f}]")
+    if sims:
+        lines += ["", f"Mean round-trip similarity: {np.mean(sims):.3f}"]
+    return "\n".join(lines)
+
+
+def _selfcheck():
+    print(f"INPUTS {INPUTS.shape}  outputs {N_ACTIVE}  (test {INPUTS_TEST.shape[0]} held out, mode '{INPUT_MODE}')")
+    print(f"GUI: Maximum nodes >= {INPUTS.shape[1] + N_ACTIVE + 30}, "
+          f"Maximum connections >= {INPUTS.shape[1] * N_ACTIVE + 400} "
+          f"(initial wiring = {INPUTS.shape[1] * N_ACTIVE})")
+    unknown = sorted(w for w in VOCAB if M_ALL[_W[w]].sum() == 0)
+    print("corpus words with no prime mapping:", unknown or "none")
+    print(f"sentences: {N_SENT} ({len(TRAIN_IDX)} train / {len(TEST_IDX)} test), vocabulary {len(VOCAB)} words")
+    unseen = sorted(set(VOCAB[i] for i in range(len(VOCAB)) if SRC_TE[:, i].any()) - {VOCAB[i] for i in TRAIN_WORDS})
+    print("test words never seen in training:", unseen or "none")
+
+    rng = np.random.default_rng(0)
+    shape = NEED_TR.shape
+    flip = np.abs(NEED_TR - (rng.random(shape) < 0.1)).astype(np.float32)
+    cases = {
+        "oracle (rule consequences)": NEED_TR,
+        "all primes on": np.ones(shape, np.float32),
+        "all primes off": np.zeros(shape, np.float32),
+        "all outputs 0.5": np.full(shape, 0.5, np.float32),
+        "random binary": (rng.random(shape) > 0.5).astype(np.float32),
+        "NaN network": np.full(shape, np.nan, np.float32),
+        "oracle with 10% flipped": flip,
+    }
+    print("\nfitness (0 is perfect, -1 is worst):")
+    scores = {}
+    for name, preds in cases.items():
+        scores[name] = float(fitness(preds, TARGETS))
+        print(f"  {name:28} {scores[name]:8.4f}")
+    others = [v for k, v in scores.items() if not k.startswith("oracle")]
+    assert abs(scores["oracle (rule consequences)"]) < 1e-3
+    assert scores["oracle (rule consequences)"] > scores["oracle with 10% flipped"] > max(others)
+    assert all(np.isfinite(v) and -1.0 <= v <= 0.0 for v in scores.values())
+    ev = evaluate(NEED_TR, _need(SRC_TE))
+    assert ev["train"]["exact"] == 1.0 and ev["test"]["exact"] == 1.0
+    print("\nself-check passed")
+
+
+if __name__ == "__main__":
+    _selfcheck()
